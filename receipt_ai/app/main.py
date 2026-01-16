@@ -3,8 +3,8 @@ import json
 import time
 from typing import Any, Dict, List
 from pathlib import Path
-from fastapi.staticfiles import StaticFiles
-from .utils import dedup_candidates
+from threading import Lock
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,8 +21,8 @@ from .utils import (
     build_llm_input_text,
     pair_items_from_ocr_lines,
     postprocess,
+    dedup_candidates,
 )
-
 
 # ========== Config ==========
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -36,18 +36,31 @@ client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 # OCR language: for Germany receipts use "german"; for mixed try "en"
 OCR_LANG = os.getenv("OCR_LANG", "german")
-ocr_engine = PaddleOCR(use_angle_cls=True, lang=OCR_LANG)
 
-app = FastAPI(title="Receipt AI (OCR + DeepSeek)", version="1.1.0")
+# --------- OCR lazy init (important for Render stability) ----------
+_ocr = None
+_ocr_lock = Lock()
 
-# Serve static page
-app.mount("/static", StaticFiles(directory="static"), name="static")
+def get_ocr() -> PaddleOCR:
+    global _ocr
+    if _ocr is None:
+        with _ocr_lock:
+            if _ocr is None:
+                print(f"[OCR] initializing PaddleOCR lang={OCR_LANG} ...")
+                _ocr = PaddleOCR(use_angle_cls=True, lang=OCR_LANG)
+                print("[OCR] PaddleOCR ready.")
+    return _ocr
+# ------------------------------------------------------------------
 
+app = FastAPI(title="Receipt AI (OCR + DeepSeek)", version="1.2.0")
+
+# Paths
 APP_DIR = Path(__file__).resolve().parent          # .../receipt_ai/app
 BASE_DIR = APP_DIR.parent                          # .../receipt_ai
 STATIC_DIR = BASE_DIR / "static"
 INDEX_HTML = STATIC_DIR / "index.html"
 
+# Serve static files once
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/")
@@ -57,7 +70,6 @@ def home():
     return FileResponse(str(INDEX_HTML))
 
 
-
 def run_ocr_bytes(image_bytes: bytes) -> Dict[str, Any]:
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -65,10 +77,13 @@ def run_ocr_bytes(image_bytes: bytes) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
     np_img = np.array(img)
-    result = ocr_engine.ocr(np_img, cls=True)
 
-    lines = []
-    full = []
+    ocr = get_ocr()
+    result = ocr.ocr(np_img, cls=True)
+
+    lines: List[Dict[str, Any]] = []
+    full: List[str] = []
+
     for block in result:
         for entry in block:
             text = normalize_money((entry[1][0] or "").strip())
@@ -81,11 +96,6 @@ def run_ocr_bytes(image_bytes: bytes) -> Dict[str, Any]:
 
 
 def build_messages(ocr_text: str, currency: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    We pass:
-    - filtered OCR text (less noise, fewer tokens)
-    - item candidates from local pairing (more structure)
-    """
     system = f"""
 You are a receipt understanding engine.
 Output ONLY valid JSON (no markdown, no commentary).
@@ -161,9 +171,6 @@ Rules:
 
 
 def call_deepseek(messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    """
-    Adds timeout + retry + log.
-    """
     last_err = None
     for attempt in range(2):
         try:
@@ -214,6 +221,7 @@ async def parse_receipt(
     # 3) Local pairing (reduce LLM mistakes + fewer tokens)
     candidates = pair_items_from_ocr_lines(ocr_out["ocr_lines"])
     candidates = dedup_candidates(candidates)
+
     # 4) LLM
     messages = build_messages(filtered_text, currency=currency, candidates=candidates)
     structured = call_deepseek(messages)
