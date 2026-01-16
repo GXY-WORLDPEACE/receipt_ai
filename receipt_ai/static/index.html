@@ -5,20 +5,64 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Receipt AI</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-    .card { max-width: 860px; padding: 16px; border: 1px solid #ddd; border-radius: 12px; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #333; background: #111; color: #fff; cursor: pointer; }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
-    input[type="file"] { padding: 8px; }
-    pre { white-space: pre-wrap; word-break: break-word; background: #f7f7f7; padding: 12px; border-radius: 10px; overflow: auto; }
-    .muted { color: #666; font-size: 13px; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      margin: 24px;
+      background: #fafafa;
+    }
+    .card {
+      max-width: 900px;
+      padding: 16px;
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      background: #fff;
+    }
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    button {
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid #333;
+      background: #111;
+      color: #fff;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    input[type="file"] {
+      padding: 8px;
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #f7f7f7;
+      padding: 12px;
+      border-radius: 10px;
+      overflow: auto;
+      max-height: 420px;
+    }
+    .muted {
+      color: #666;
+      font-size: 13px;
+    }
+    canvas {
+      margin-top: 12px;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      background: #fff;
+    }
   </style>
 </head>
 <body>
   <div class="card">
     <h2>Receipt AI (OCR + DeepSeek)</h2>
-    <p class="muted">上传小票图片 → 自动解析商品/金额/分类 → 输出 JSON</p>
+    <p class="muted">上传小票图片 → 自动解析商品 / 金额 / 分类 → 可视化占比</p>
 
     <div class="row">
       <input id="file" type="file" accept="image/*" />
@@ -34,10 +78,72 @@
     </div>
 
     <p id="status" class="muted"></p>
+
+    <h3>解析结果（JSON）</h3>
     <pre id="out">{}</pre>
+
+    <h3>分类占比（按金额）</h3>
+    <canvas id="categoryChart" width="400" height="400"></canvas>
   </div>
 
 <script>
+function drawCategoryPie(items) {
+  const totals = {};
+  items = items || [];
+
+  // 汇总每个分类的金额
+  for (const it of items) {
+    const cat = (it.category || "其他").trim();
+    const v = typeof it.line_total === "number" ? it.line_total : 0;
+    if (v <= 0) continue;
+    totals[cat] = (totals[cat] || 0) + v;
+  }
+
+  const categories = Object.keys(totals);
+  const values = Object.values(totals);
+
+  const canvas = document.getElementById("categoryChart");
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (categories.length === 0) {
+    ctx.fillText("暂无可视化数据", 10, 20);
+    return;
+  }
+
+  const totalSum = values.reduce((a, b) => a + b, 0);
+  let startAngle = 0;
+
+  const colors = [
+    "#4CAF50", "#FF9800", "#2196F3",
+    "#E91E63", "#9C27B0", "#FFC107",
+    "#009688", "#795548"
+  ];
+
+  // 画扇形
+  values.forEach((value, i) => {
+    const slice = (value / totalSum) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(200, 200);
+    ctx.arc(200, 200, 150, startAngle, startAngle + slice);
+    ctx.closePath();
+    ctx.fillStyle = colors[i % colors.length];
+    ctx.fill();
+    startAngle += slice;
+  });
+
+  // 图例
+  let legendY = 20;
+  categories.forEach((cat, i) => {
+    const pct = ((totals[cat] / totalSum) * 100).toFixed(1);
+    ctx.fillStyle = colors[i % colors.length];
+    ctx.fillRect(10, legendY, 12, 12);
+    ctx.fillStyle = "#000";
+    ctx.fillText(`${cat} (${pct}%)`, 30, legendY + 10);
+    legendY += 20;
+  });
+}
+
 async function run() {
   const fileInput = document.getElementById('file');
   const btn = document.getElementById('btn');
@@ -70,10 +176,17 @@ async function run() {
     }
 
     status.textContent = '解析完成 ✅';
+
+    let data = null;
     try {
-      out.textContent = JSON.stringify(JSON.parse(text), null, 2);
+      data = JSON.parse(text);
+      out.textContent = JSON.stringify(data, null, 2);
     } catch {
       out.textContent = text;
+    }
+
+    if (data && data.items) {
+      drawCategoryPie(data.items);
     }
   } catch (e) {
     status.textContent = '请求异常';
