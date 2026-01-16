@@ -87,8 +87,13 @@ def warmup():
     - 触发 PaddleOCR 初始化（如果是懒加载）
     - 让 Render 的实例“热起来”
     """
-    _ = get_ocr()
-    return {"ok": True, "ocr_lang": OCR_LANG, "model": DEEPSEEK_MODEL}
+    try:
+        _ = get_ocr()
+        return {"ok": True, "ocr_lang": OCR_LANG, "model": DEEPSEEK_MODEL}
+    except Exception as e:
+        # 让你在 Render 上一眼看出 warmup 为什么失败
+        raise HTTPException(status_code=500, detail=f"OCR warmup failed: {repr(e)}")
+
 
 
 def run_ocr_bytes(image_bytes: bytes) -> Dict[str, Any]:
