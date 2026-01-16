@@ -13,6 +13,8 @@ export OCR_LANG="german"
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 
+GXY-WORLDPEACE
+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
 
 ## 3) Run
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
