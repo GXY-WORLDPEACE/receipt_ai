@@ -29,13 +29,15 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+OCR_LANG = os.getenv("OCR_LANG", "german")
+
+# 限制是否串行处理（Render 小机器上更稳；如果你升配可以关掉）
+SERIALIZE_REQUESTS = os.getenv("SERIALIZE_REQUESTS", "1") == "1"
+
 if not DEEPSEEK_API_KEY:
     print("WARNING: DEEPSEEK_API_KEY is empty. Set it before starting.")
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-
-# OCR language: for Germany receipts use "german"; for mixed try "en"
-OCR_LANG = os.getenv("OCR_LANG", "german")
 
 # --------- OCR lazy init (important for Render stability) ----------
 _ocr = None
@@ -47,20 +49,23 @@ def get_ocr() -> PaddleOCR:
         with _ocr_lock:
             if _ocr is None:
                 print(f"[OCR] initializing PaddleOCR lang={OCR_LANG} ...")
-                _ocr = PaddleOCR(use_angle_cls=True, lang=OCR_LANG)
+                # show_log=False：避免日志过多 + 更稳
+                _ocr = PaddleOCR(use_angle_cls=True, lang=OCR_LANG, show_log=False)
                 print("[OCR] PaddleOCR ready.")
     return _ocr
 # ------------------------------------------------------------------
 
-app = FastAPI(title="Receipt AI (OCR + DeepSeek)", version="1.2.0")
+# 可选：串行锁，避免并发时 OCR+LLM 抢 CPU/内存导致抖动
+_req_lock = Lock()
 
-# Paths
+app = FastAPI(title="Receipt AI (OCR + DeepSeek)", version="1.3.0")
+
+# ---------- Static page ----------
 APP_DIR = Path(__file__).resolve().parent          # .../receipt_ai/app
 BASE_DIR = APP_DIR.parent                          # .../receipt_ai
 STATIC_DIR = BASE_DIR / "static"
 INDEX_HTML = STATIC_DIR / "index.html"
 
-# Serve static files once
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/")
@@ -68,6 +73,22 @@ def home():
     if not INDEX_HTML.exists():
         raise HTTPException(status_code=500, detail=f"Missing {INDEX_HTML}")
     return FileResponse(str(INDEX_HTML))
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/warmup")
+def warmup():
+    """
+    部署后先访问一次 /warmup：
+    - 触发 PaddleOCR 初始化（如果是懒加载）
+    - 让 Render 的实例“热起来”
+    """
+    _ = get_ocr()
+    return {"ok": True, "ocr_lang": OCR_LANG, "model": DEEPSEEK_MODEL}
 
 
 def run_ocr_bytes(image_bytes: bytes) -> Dict[str, Any]:
@@ -95,7 +116,11 @@ def run_ocr_bytes(image_bytes: bytes) -> Dict[str, Any]:
     return {"ocr_text": "\n".join(full), "ocr_lines": lines}
 
 
-def build_messages(ocr_text: str, currency: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+def build_messages(
+    ocr_text: str,
+    currency: str,
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
     system = f"""
 You are a receipt understanding engine.
 Output ONLY valid JSON (no markdown, no commentary).
@@ -143,15 +168,6 @@ Categories (choose exactly one):
 - 日用品/家居
 - 其他
 
-Examples:
-- onions, potatoes, tomatoes, grapes, strawberries, carrots, salad, zucchini, garlic -> 生鲜蔬果
-- turkey, chicken, beef, pork -> 肉禽海鲜
-- cheese, sour cream, milk, yogurt, eggs -> 乳制品/蛋奶
-- nuts, bars, chips, cookies -> 零食/坚果
-- cola, juice, water -> 饮料
-- rice, pasta, sauce, chili/sriracha, oil -> 主食/调味/粮油
-- sport cap, detergent, tissue -> 日用品/家居
-
 Rules:
 - Keep duplicate lines as separate items (do NOT merge).
 - Parse amounts carefully; decimal separator is '.'.
@@ -171,7 +187,10 @@ Rules:
 
 
 def call_deepseek(messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    last_err = None
+    """
+    timeout + retry + clear logs.
+    """
+    last_err: Exception | None = None
     for attempt in range(2):
         try:
             t0 = time.time()
@@ -184,19 +203,22 @@ def call_deepseek(messages: List[Dict[str, str]]) -> Dict[str, Any]:
             )
             content = resp.choices[0].message.content or ""
             dt = time.time() - t0
-            print(f"[DeepSeek] ok attempt={attempt+1} in {dt:.2f}s, chars={len(content)}")
-            return json.loads(content)
+            print(f"[LLM] ok model={DEEPSEEK_MODEL} attempt={attempt+1} {dt:.2f}s chars={len(content)}")
+
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as je:
+                print("[LLM] JSON decode error:", str(je))
+                print("[LLM] raw content head:", content[:300])
+                raise HTTPException(status_code=502, detail="LLM returned non-JSON output.")
+        except HTTPException:
+            raise
         except Exception as e:
             last_err = e
-            print(f"[DeepSeek] failed attempt={attempt+1}: {repr(e)}")
-            time.sleep(0.5)
+            print(f"[LLM] failed attempt={attempt+1}: {repr(e)}")
+            time.sleep(0.6)
 
     raise HTTPException(status_code=502, detail=f"DeepSeek API error: {str(last_err)}")
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}
 
 
 @app.post("/v1/receipt/parse")
@@ -208,35 +230,45 @@ async def parse_receipt(
     if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
         raise HTTPException(status_code=400, detail="Only jpg/png/webp supported.")
 
-    image_bytes = await file.read()
+    # 可选：串行（更稳）
+    lock = _req_lock if SERIALIZE_REQUESTS else None
+    if lock:
+        lock.acquire()
 
-    # 1) OCR
-    ocr_out = run_ocr_bytes(image_bytes)
-    if not ocr_out["ocr_text"].strip():
-        raise HTTPException(status_code=422, detail="OCR produced empty text. Try a clearer photo.")
+    try:
+        image_bytes = await file.read()
 
-    # 2) Filter OCR text (reduce noise/tokens)
-    filtered_text = build_llm_input_text(ocr_out["ocr_lines"])
+        # 1) OCR
+        ocr_out = run_ocr_bytes(image_bytes)
+        if not ocr_out["ocr_text"].strip():
+            raise HTTPException(status_code=422, detail="OCR produced empty text. Try a clearer photo.")
 
-    # 3) Local pairing (reduce LLM mistakes + fewer tokens)
-    candidates = pair_items_from_ocr_lines(ocr_out["ocr_lines"])
-    candidates = dedup_candidates(candidates)
+        # 2) Filter OCR text (reduce noise/tokens)
+        filtered_text = build_llm_input_text(ocr_out["ocr_lines"])
 
-    # 4) LLM
-    messages = build_messages(filtered_text, currency=currency, candidates=candidates)
-    structured = call_deepseek(messages)
+        # 3) Local pairing (reduce LLM mistakes + fewer tokens)
+        candidates = pair_items_from_ocr_lines(ocr_out["ocr_lines"])
+        candidates = dedup_candidates(candidates)
 
-    # 5) Postprocess (strip whitespace, clamp confidence, normalize)
-    structured = postprocess(structured)
+        # 4) LLM
+        messages = build_messages(filtered_text, currency=currency, candidates=candidates)
+        structured = call_deepseek(messages)
 
-    # attach debug info only if requested
-    if debug:
-        structured["raw"] = ocr_out
-        structured["debug"] = {
-            "filtered_text": filtered_text,
-            "item_candidates": candidates,
-            "model": DEEPSEEK_MODEL,
-            "ocr_lang": OCR_LANG,
-        }
+        # 5) Postprocess
+        structured = postprocess(structured)
 
-    return JSONResponse(content=structured)
+        if debug:
+            structured["raw"] = ocr_out
+            structured["debug"] = {
+                "filtered_text": filtered_text,
+                "item_candidates": candidates,
+                "model": DEEPSEEK_MODEL,
+                "ocr_lang": OCR_LANG,
+                "serialize_requests": SERIALIZE_REQUESTS,
+            }
+
+        return JSONResponse(content=structured)
+
+    finally:
+        if lock:
+            lock.release()
